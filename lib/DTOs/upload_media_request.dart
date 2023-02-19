@@ -5,4 +5,5 @@ class UploadMediaRequest extends DialoguewiseRequest {
   ///Sets the path to the file on local device that needs to be uploaded.
   String localFilePath = '';
   List<int> fileData = [];
+  String? mimeType;
 }

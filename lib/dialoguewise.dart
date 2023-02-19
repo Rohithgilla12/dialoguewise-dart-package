@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'dart:io';
 
 import 'package:dialogue_wise/DTOs/add_contents_request.dart';
 import 'package:dialogue_wise/DTOs/delete_content_request.dart';
@@ -9,13 +10,15 @@ import 'package:dialogue_wise/DTOs/search_contents_request.dart';
 import 'package:dialogue_wise/DTOs/update_content_request.dart';
 import 'package:dialogue_wise/DTOs/upload_media_request.dart';
 import 'package:dialogue_wise/constants/endpoints.dart';
-import 'package:http/http.dart' as http;
-import 'package:universal_io/io.dart';
+import 'package:dio/dio.dart';
+import 'package:http_parser/http_parser.dart';
 
 ///Allows you to manage your content using Dialoguewise Headless CMS
 class DialoguewiseService {
   String _apiBaseUrl = '';
   final String accessToken;
+
+  late Dio _dio;
 
   DialoguewiseService({
     String? apiBaseUrl,
@@ -29,6 +32,19 @@ class DialoguewiseService {
     } else {
       _apiBaseUrl = '';
     }
+    _dio = Dio(
+      BaseOptions(
+          baseUrl: apiBaseUrl ?? 'https://api.dialoguewise.com/api/',
+          connectTimeout: const Duration(seconds: 5),
+          receiveTimeout: const Duration(seconds: 5),
+          headers: {
+            'Access-Control-Allow-Origin': '*',
+            'Access-Control-Allow-Methods': '*',
+            'Access-Control-Allow-Headers': 'Content-Type, Access-Token',
+            'Content-Type': 'application/json',
+            'Access-Token': accessToken,
+          }),
+    );
   }
 
   String get apiBaseUrl {
@@ -51,8 +67,8 @@ class DialoguewiseService {
   ///
   /// final res = await dialogueWiseService.getDialogues();
   Future<DialoguewiseResponse> getDialogues() async {
-    http.Request clientRequest =
-        _getHeader(accessToken, Endpoints.getDialogues, isGet: true);
+    final RequestOptions clientRequest =
+        _getRequest(Endpoints.getDialogues, isGet: true);
 
     return _getResponse(clientRequest);
   }
@@ -64,8 +80,7 @@ class DialoguewiseService {
       throw FormatException("Please provide the Slug.");
     }
 
-    http.Request clientRequest = _getHeader(
-      accessToken,
+    final clientRequest = _getRequest(
       '${Endpoints.getVariables}?slug=${request.slug}',
       isGet: true,
     );
@@ -83,8 +98,8 @@ class DialoguewiseService {
       throw FormatException("Please set both pageSize and pageIndex");
     }
 
-    http.Request clientRequest = _getHeader(accessToken, Endpoints.getContents);
-    clientRequest.body = jsonEncode(request);
+    final RequestOptions clientRequest =
+        _getRequest(Endpoints.getContents, data: request);
 
     return _getResponse(clientRequest);
   }
@@ -97,9 +112,7 @@ class DialoguewiseService {
       throw FormatException("Please provide a Slug.");
     }
 
-    http.Request clientRequest =
-        _getHeader(accessToken, Endpoints.searchContents);
-    clientRequest.body = jsonEncode(request);
+    final clientRequest = _getRequest(Endpoints.searchContents, data: request);
 
     return _getResponse(clientRequest);
   }
@@ -115,8 +128,7 @@ class DialoguewiseService {
       throw FormatException("Please provide a source name.");
     }
 
-    http.Request clientRequest = _getHeader(accessToken, Endpoints.addContents);
-    clientRequest.body = jsonEncode(request);
+    final clientRequest = _getRequest(Endpoints.addContents, data: request);
 
     return _getResponse(clientRequest);
   }
@@ -135,9 +147,7 @@ class DialoguewiseService {
       throw FormatException("Please provide a source name.");
     }
 
-    http.Request clientRequest =
-        _getHeader(accessToken, Endpoints.updateContent);
-    clientRequest.body = jsonEncode(request);
+    final clientRequest = _getRequest(Endpoints.updateContent, data: request);
 
     return _getResponse(clientRequest);
   }
@@ -155,9 +165,7 @@ class DialoguewiseService {
       throw FormatException("Please provide a source name.");
     }
 
-    http.Request clientRequest =
-        _getHeader(accessToken, Endpoints.deleteContent);
-    clientRequest.body = jsonEncode(request);
+    final clientRequest = _getRequest(Endpoints.deleteContent, data: request);
 
     return _getResponse(clientRequest);
   }
@@ -165,57 +173,93 @@ class DialoguewiseService {
   ///Uploads an image or file and returns the file URL.
   ///Takes [request] of type UploadMediaRequest.
   Future<DialoguewiseResponse> uploadMedia(UploadMediaRequest request) async {
-    if (request.localFilePath.isEmpty || request.fileData.isEmpty) {
+    if (request.fileData.isEmpty && request.localFilePath.isEmpty) {
       throw FormatException(
           "Please provide the local path of file to be uploaded.");
-    } else if ((Platform.isAndroid || Platform.isIOS) &&
-        FileSystemEntity.typeSync(request.localFilePath) ==
-            FileSystemEntityType.notFound) {
-      throw FormatException("Unable to find file ${request.localFilePath}.");
     }
 
-    var apiUrl = '${apiBaseUrl}dialogue/uploadmedia';
-    var uri = Uri.parse(apiUrl);
-    var httpRequest = http.MultipartRequest('POST', uri)
-      ..headers['Access-Control-Allow-origin'] = '*'
-      ..headers['Access-Control-Allow-Methods'] = '*'
-      ..headers['Access-Control-Allow-Headers'] = 'Content-Type, Access-Token'
-      ..headers['Access-Token'] = accessToken
-      ..files.add(
-        request.localFilePath.isNotEmpty
-            ? await http.MultipartFile.fromPath('file', request.localFilePath)
-            : http.MultipartFile.fromBytes('file', request.fileData),
-      );
-    var response = await httpRequest.send();
-    DialoguewiseResponse dialogueWiseResponse = DialoguewiseResponse(
-      reasonPhrase: response.reasonPhrase ?? 'Something went wrong.',
-      statusCode: response.statusCode,
+    if (request.fileData.isEmpty && request.localFilePath.isNotEmpty) {
+      if ((Platform.isAndroid || Platform.isIOS) &&
+          FileSystemEntity.typeSync(request.localFilePath) ==
+              FileSystemEntityType.notFound) {
+        throw FormatException("Unable to find file ${request.localFilePath}.");
+      }
+    }
+
+    final fileName = request.localFilePath.isNotEmpty
+        ? request.localFilePath.split('/').last
+        : 'image.png';
+
+    List<String> mediaType = [];
+
+    if (request.fileData.isNotEmpty && request.mimeType == null) {
+      throw FormatException("Please provide the mime type of the file.");
+    }
+
+    if (request.fileData.isNotEmpty) {
+      mediaType = request.mimeType!.split('/');
+    }
+
+    final Response<String> response = await _dio.fetch(
+      RequestOptions(
+        path: '${apiBaseUrl}dialogue/uploadmedia',
+        method: 'POST',
+        headers: {
+          'Access-Control-Allow-origin': '*',
+          'Access-Control-Allow-Methods': '*',
+          'Access-Control-Allow-Headers': 'Content-Type, Access-Token',
+          'Access-Token': accessToken,
+        },
+        data: FormData.fromMap(
+          {
+            'file': request.fileData.isNotEmpty
+                ? MultipartFile.fromBytes(
+                    request.fileData,
+                    contentType: MediaType(
+                      mediaType.first,
+                      mediaType.last,
+                    ),
+                    filename: '$fileName.${mediaType.last}',
+                  )
+                : await MultipartFile.fromFile(
+                    request.localFilePath,
+                  ),
+          },
+        ),
+        contentType: 'multipart/form-data',
+      ),
     );
-    var responseBody = await response.stream.bytesToString();
+
+    DialoguewiseResponse dialogueWiseResponse = DialoguewiseResponse(
+      reasonPhrase: response.statusMessage ?? 'Something went wrong.',
+      statusCode: response.statusCode ?? 500,
+    );
+    final responseBody = jsonDecode(response.data ?? '{}');
+
     if (responseBody.isNotEmpty) {
       dialogueWiseResponse = dialogueWiseResponse.copyWith(
-        response: jsonDecode(responseBody) as Map<String, dynamic>,
+        response: responseBody as Map<String, dynamic>,
       );
     }
 
     return dialogueWiseResponse;
   }
 
-  Future<DialoguewiseResponse> _getResponse(http.Request clientRequest) async {
-    http.Client httpClient = http.Client();
-    http.StreamedResponse response = await httpClient.send(clientRequest);
-    String responseBody = await response.stream.bytesToString();
-    httpClient.close();
+  Future<DialoguewiseResponse> _getResponse(
+      RequestOptions clientRequest) async {
+    final Response<String> response = await _dio.fetch(clientRequest);
+    final responseBody = response.data;
+    _dio.close();
 
     DialoguewiseResponse dialogueWiseResponse = DialoguewiseResponse(
-      reasonPhrase: response.reasonPhrase ?? 'Something went wrong.',
-      statusCode: response.statusCode,
+      reasonPhrase: response.statusMessage ?? 'Something went wrong.',
+      statusCode: response.statusCode ?? 500,
     );
 
-    if (responseBody.isNotEmpty) {
+    if (responseBody?.isNotEmpty == true) {
       try {
         dialogueWiseResponse = dialogueWiseResponse.copyWith(
-          response: jsonDecode(responseBody) as Map<String, dynamic>,
+          response: jsonDecode(responseBody ?? '{}') as Map<String, dynamic>,
         );
       } catch (e) {
         final Map<String, dynamic> errorResponse = {
@@ -228,21 +272,24 @@ class DialoguewiseService {
     return dialogueWiseResponse;
   }
 
-  http.Request _getHeader(
-    String accessToken,
+  RequestOptions _getRequest(
     String apiRoute, {
+    dynamic data,
     bool isGet = false,
   }) {
-    var apiUrl = apiBaseUrl + apiRoute;
-    http.Request clientRequest =
-        http.Request(isGet ? 'GET' : 'POST', Uri.parse(apiUrl));
-    clientRequest.headers['Access-Control-Allow-origin'] = '*';
-    clientRequest.headers['Access-Control-Allow-Methods'] = '*';
-    clientRequest.headers['Access-Control-Allow-Headers'] =
-        'Content-Type, Access-Token';
-    clientRequest.headers['Content-Type'] = 'application/json';
-    clientRequest.headers['Access-Token'] = accessToken;
+    final requestOptions = RequestOptions(
+      path: '$apiBaseUrl$apiRoute',
+      method: isGet ? 'GET' : 'POST',
+      data: jsonEncode(data),
+      headers: {
+        'Access-Control-Allow-origin': '*',
+        'Access-Control-Allow-Methods': '*',
+        'Access-Control-Allow-Headers': 'Content-Type, Access-Token',
+        'Content-Type': 'application/json',
+        'Access-Token': accessToken,
+      },
+    );
 
-    return clientRequest;
+    return requestOptions;
   }
 }
